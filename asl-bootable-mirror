@@ -1,0 +1,1074 @@
+#!/usr/bin/env bash
+# ASL/DVSwitch Bootable Mirror v1.0
+# Copyright (c) 2026 Jeff Milne, KE2HNI
+# Licensed under the BSD 3-Clause License.
+#
+# Creates verified, bootable filesystem mirrors for Raspberry Pi 4/5 systems.
+# This is an original file-level implementation using rsync, fresh destination
+# filesystems, unique PARTUUIDs, and Raspberry Pi boot-configuration updates.
+#
+# Partition and PARTUUID safety concepts were informed by the rpi-clone project
+# by Bill Wilson and later community-maintained forks.
+
+set -Eeuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+readonly PROGRAM="asl-bootable-mirror"
+readonly VERSION="1.0"
+readonly MOUNT_ROOT="/mnt/asl-bootable-mirror"
+readonly LOCK_FILE="/run/lock/asl-bootable-mirror.lock"
+readonly LOG_FILE="${ASL_BOOTABLE_MIRROR_LOG_FILE:-/var/log/asl-bootable-mirror.log}"
+readonly MARKER_REL="var/lib/asl-bootable-mirror/clone.conf"
+readonly INIT_MARKER_REL="var/lib/asl-bootable-mirror/initialized.conf"
+readonly REPORT_REL="var/lib/asl-bootable-mirror/last-report.txt"
+readonly METADATA_DIR_REL="var/lib/asl-bootable-mirror"
+PREFLIGHT_ONLY="NO"
+START_EPOCH="$(date +%s)"
+
+DEST_DISK=""
+DEST_ROOT=""
+DEST_BOOT=""
+SOURCE_DISK=""
+SOURCE_ROOT=""
+SOURCE_BOOT=""
+BOOT_MOUNT=""
+MODE=""
+CONTENT_VERIFIED="NO"
+SERVICES_PAUSED="NO"
+declare -a STOPPED_SERVICES=()
+declare -a MOUNTED_PATHS=()
+declare -a RUNNING_SERVICES=()
+declare -a RECOMMENDED_SERVICES=()
+declare -a SELECTED_SERVICES=()
+
+format_duration() {
+	local seconds="$1"
+	printf '%02d:%02d:%02d' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+}
+
+stage_header() {
+	local number="$1" title="$2" now elapsed
+	now="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+	elapsed="$(( $(date +%s) - START_EPOCH ))"
+	echo
+	echo "================================================================"
+	printf 'STAGE %s — %s\n' "$number" "$title"
+	echo "System time : $now"
+	printf 'Elapsed     : %s\n' "$(format_duration "$elapsed")"
+	[ -n "$DEST_DISK" ] && printf 'Destination : %s — %s\n' "$DEST_DISK" "$(lsblk -dnro MODEL "$DEST_DISK" 2>/dev/null | xargs)"
+	echo "================================================================"
+}
+
+run_with_spinner() {
+	local description="$1" output_file pid status=0 started elapsed frame_index=0
+	shift
+	local -a frames=('|' '/' '-' '\')
+	output_file="$(mktemp)"
+	started="$(date +%s)"
+	"$@" >"$output_file" 2>&1 &
+	pid=$!
+	while kill -0 "$pid" 2>/dev/null; do
+		elapsed="$(( $(date +%s) - started ))"
+		printf '\r%s %s  Elapsed %s' "$description" "${frames[$frame_index]}" "$(format_duration "$elapsed")"
+		frame_index=$(((frame_index + 1) % 4))
+		sleep 1
+	done
+	wait "$pid" || status=$?
+	elapsed="$(( $(date +%s) - started ))"
+	printf '\r%-62s\n' "$description — finished in $(format_duration "$elapsed")"
+	cat "$output_file" >>"$LOG_FILE"
+	if [ "$status" -ne 0 ]; then
+		echo
+		cat "$output_file"
+	fi
+	rm -f "$output_file"
+	return "$status"
+}
+
+log() {
+	printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$LOG_FILE"
+}
+
+die() {
+	log "ERROR: $*"
+	exit 1
+}
+
+cleanup() {
+	local status=$?
+	set +e
+	for ((i=${#MOUNTED_PATHS[@]}-1; i>=0; i--)); do
+		mountpoint -q "${MOUNTED_PATHS[$i]}" && umount "${MOUNTED_PATHS[$i]}"
+	done
+	[ "${#STOPPED_SERVICES[@]}" -eq 0 ] || systemctl start "${STOPPED_SERVICES[@]}"
+	if [ "${#STOPPED_SERVICES[@]}" -gt 0 ]; then
+		log "Restarted services that were paused: ${STOPPED_SERVICES[*]}"
+	fi
+	rmdir "$MOUNT_ROOT/boot/firmware" "$MOUNT_ROOT/boot" "$MOUNT_ROOT" 2>/dev/null || true
+	exit "$status"
+}
+
+trap cleanup EXIT INT TERM
+
+require_root() {
+	[ "$(id -u)" -eq 0 ] || die "Run with sudo."
+	exec 9>"$LOCK_FILE"
+	flock -n 9 || die "Another $PROGRAM operation is already running."
+}
+
+require_commands() {
+	local missing=()
+	for command in awk blkid blockdev dmesg e2fsck find findmnt flock fsck.vfat lsblk mkfs.ext4 mkfs.vfat mount partprobe rsync sfdisk sha256sum sort sync systemctl udevadm umount wipefs xargs; do
+		command -v "$command" >/dev/null 2>&1 || missing+=("$command")
+	done
+	[ "${#missing[@]}" -eq 0 ] || die "Missing required commands: ${missing[*]}"
+}
+
+parent_disk() {
+	local device="$1" parent
+	parent="$(lsblk -nro PKNAME "$device" 2>/dev/null | head -n1)"
+	[ -n "$parent" ] || die "Cannot determine the parent disk of $device."
+	printf '/dev/%s\n' "$parent"
+}
+
+partition_path() {
+	local disk="$1" number="$2"
+	case "$disk" in
+		/dev/nvme*|/dev/mmcblk*) printf '%sp%s\n' "$disk" "$number" ;;
+		*) printf '%s%s\n' "$disk" "$number" ;;
+	esac
+}
+
+detect_source() {
+	local source_root_partuuid source_root_uuid fstab_boot_device fstab_root_device cmdline_reference
+	SOURCE_ROOT="$(findmnt -nro SOURCE /)"
+	SOURCE_DISK="$(parent_disk "$SOURCE_ROOT")"
+	if findmnt -rn /boot/firmware >/dev/null 2>&1; then
+		BOOT_MOUNT="/boot/firmware"
+	elif findmnt -rn /boot >/dev/null 2>&1; then
+		BOOT_MOUNT="/boot"
+	else
+		die "Neither /boot/firmware nor /boot is a mounted boot filesystem."
+	fi
+	SOURCE_BOOT="$(findmnt -nro SOURCE "$BOOT_MOUNT")"
+	[ "$(parent_disk "$SOURCE_BOOT")" = "$SOURCE_DISK" ] || die "Root and boot are not on the same source disk."
+	[ "$(lsblk -dnro PTTYPE "$SOURCE_DISK")" = "dos" ] || die "Version $VERSION supports a DOS/MBR source layout only."
+	[ "$(lsblk -nro TYPE "$SOURCE_DISK" | awk '$1=="part"{n++} END{print n+0}')" -eq 2 ] || die "The source must contain exactly two partitions."
+	[ "$(findmnt -nro FSTYPE "$BOOT_MOUNT")" = "vfat" ] || die "The source boot filesystem must be FAT."
+	[ "$(findmnt -nro FSTYPE /)" = "ext4" ] || die "The source root filesystem must be ext4."
+	source_root_partuuid="$(blkid -s PARTUUID -o value "$SOURCE_ROOT")"
+	source_root_uuid="$(blkid -s UUID -o value "$SOURCE_ROOT")"
+	fstab_boot_device="$(findmnt --fstab --evaluate --target "$BOOT_MOUNT" -n -o SOURCE)"
+	fstab_root_device="$(findmnt --fstab --evaluate --target / -n -o SOURCE)"
+	[ "$(readlink -f "$fstab_boot_device")" = "$(readlink -f "$SOURCE_BOOT")" ] || die "Source boot entry in /etc/fstab does not resolve to the active boot partition."
+	[ "$(readlink -f "$fstab_root_device")" = "$(readlink -f "$SOURCE_ROOT")" ] || die "Source root entry in /etc/fstab does not resolve to the active root partition."
+	cmdline_reference="$(grep -oE 'root=[^ ]+' "$BOOT_MOUNT/cmdline.txt" | head -n1)"
+	case "$cmdline_reference" in
+		"root=PARTUUID=$source_root_partuuid"|"root=UUID=$source_root_uuid"|"root=$SOURCE_ROOT") ;;
+		*) die "The active cmdline.txt root reference does not identify $SOURCE_ROOT." ;;
+	esac
+}
+
+show_boot_reminder() {
+	local order
+	order="$(rpi-eeprom-config 2>/dev/null | awk -F= '$1=="BOOT_ORDER"{print $2; exit}')"
+	echo
+	echo "BOOT REMINDER"
+	echo "-------------"
+	[ -n "$order" ] && echo "This Pi's current EEPROM BOOT_ORDER is $order."
+	echo "Pi 4 commonly checks SD card and then USB storage."
+	echo "Pi 5 commonly checks SD card, NVMe and then USB storage."
+	echo "Before testing the clone, remove any higher-priority bootable SD card"
+	echo "and disconnect any other higher-priority bootable system drive."
+	echo "This program does not change EEPROM settings or boot order."
+}
+
+select_destination() {
+	local -a disks=()
+	local disk selection
+	mapfile -t disks < <(
+		lsblk -dnpo NAME,TYPE |
+		awk '$2=="disk" && $1 !~ /^\/dev\/(zram|loop|ram)[0-9]+$/ {print $1}'
+	)
+	echo
+	echo "Active source disk (protected):"
+	lsblk -d -o NAME,SIZE,MODEL,SERIAL,WWN,TRAN "$SOURCE_DISK"
+	echo
+	echo "Available destination disks:"
+	local shown=0
+	declare -a choices=()
+	for disk in "${disks[@]}"; do
+		[ "$disk" = "$SOURCE_DISK" ] && continue
+		choices+=("$disk")
+		shown=$((shown + 1))
+		printf '\n[%d] ' "$shown"
+		lsblk -dn -o NAME,SIZE,MODEL,SERIAL,WWN,TRAN "$disk"
+		lsblk -o NAME,SIZE,FSTYPE,PTTYPE,MOUNTPOINTS "$disk" | sed '1d'
+	done
+	[ "$shown" -gt 0 ] || die "No destination disks are available."
+	echo
+	read -r -p "Select the destination number, or q to quit: " selection
+	[[ "$selection" =~ ^[0-9]+$ ]] || die "Cancelled or invalid selection."
+	[ "$selection" -ge 1 ] && [ "$selection" -le "${#choices[@]}" ] || die "Invalid destination selection."
+	DEST_DISK="${choices[$((selection-1))]}"
+	[ "$DEST_DISK" != "$SOURCE_DISK" ] || die "The active source cannot be the destination."
+	[ "$(lsblk -dnro TYPE "$DEST_DISK")" = "disk" ] || die "Destination must be a whole physical disk."
+}
+
+assert_device_identity() {
+	local expected="$1" current
+	[ -b "$DEST_DISK" ] || die "Destination disappeared: $DEST_DISK"
+	current="$(physical_device_id "$DEST_DISK")"
+	[ "$current" = "$expected" ] || die "Destination identity changed. Expected '$expected', found '$current'."
+	[ "$(parent_disk "$SOURCE_ROOT")" = "$SOURCE_DISK" ] || die "The active root source changed."
+	[ "$(parent_disk "$SOURCE_BOOT")" = "$SOURCE_DISK" ] || die "The active boot source changed."
+	[ "$(findmnt -nro SOURCE "$BOOT_MOUNT")" = "$SOURCE_BOOT" ] || die "$BOOT_MOUNT is no longer mounted from $SOURCE_BOOT."
+}
+
+physical_device_id() {
+	local disk="$1" identity
+	identity="$(udevadm info -q property -n "$disk" 2>/dev/null | awk -F= '$1=="ID_SERIAL"{sub(/^[^=]*=/,""); print; exit}')"
+	[ -n "$identity" ] || identity="$(lsblk -dnro WWN "$disk" | xargs)"
+	[ -n "$identity" ] || identity="$(lsblk -dnro SERIAL "$disk" | xargs)"
+	[ -n "$identity" ] || die "Disk has no stable serial or WWN identifier: $disk"
+	printf '%s\n' "$identity"
+}
+
+destination_serial() {
+	physical_device_id "$DEST_DISK"
+}
+
+new_kernel_storage_errors() {
+	local baseline="$1" disk_name messages
+	disk_name="${DEST_DISK##*/}"
+	messages="$(dmesg 2>/dev/null | tail -n "+$((baseline + 1))" |
+		grep -Ei "($disk_name|uas|usb).*(I/O error|timed out|timeout|abort|reset|offline|not ready|rejecting I/O|device descriptor|Buffer I/O)|((I/O error|timed out|timeout|abort|reset|offline|not ready|rejecting I/O|Buffer I/O).*(device )?$disk_name)" || true)"
+	if [ -n "$messages" ]; then
+		echo
+		echo "NEW KERNEL STORAGE ERRORS"
+		echo "-------------------------"
+		printf '%s\n' "$messages"
+		return 0
+	fi
+	return 1
+}
+
+run_storage_step() {
+	local description="$1" pause_after="$2" baseline status
+	shift 2
+	baseline="$(dmesg 2>/dev/null | wc -l)"
+	log "$description"
+	status=0
+	run_with_spinner "$description" "$@" || status=$?
+	if [ "$status" -eq 0 ]; then
+		sync
+	fi
+	if [ "$status" -eq 0 ] && [ "$pause_after" -gt 0 ]; then
+		log "Allowing the destination controller ${pause_after} seconds to settle."
+		sleep "$pause_after"
+	fi
+	if new_kernel_storage_errors "$baseline"; then
+		die "$description caused a destination storage or USB transport error."
+	fi
+	[ "$status" -eq 0 ] || die "$description failed with exit status $status."
+}
+
+wait_for_destination_partitions() {
+	local serial="$1" attempt
+	for ((attempt=1; attempt<=15; attempt++)); do
+		udevadm settle
+		if [ -b "$DEST_BOOT" ] && [ -b "$DEST_ROOT" ] &&
+			[ "$(blockdev --getsize64 "$DEST_BOOT" 2>/dev/null || echo 0)" -gt 0 ] &&
+			[ "$(blockdev --getsize64 "$DEST_ROOT" 2>/dev/null || echo 0)" -gt 0 ]; then
+			assert_device_identity "$serial"
+			return 0
+		fi
+		sleep 1
+	done
+	die "Destination partitions were not ready after 15 seconds."
+}
+
+classify_destination() {
+	DEST_BOOT="$(partition_path "$DEST_DISK" 1)"
+	DEST_ROOT="$(partition_path "$DEST_DISK" 2)"
+	if [ -b "$DEST_BOOT" ] && [ -b "$DEST_ROOT" ]; then
+		local temp
+		temp="$(mktemp -d)"
+		if mount -o ro "$DEST_ROOT" "$temp" 2>/dev/null; then
+			if [ -f "$temp/$MARKER_REL" ]; then
+				MODE="update"
+			elif [ -f "$temp/$INIT_MARKER_REL" ]; then
+				MODE="resume"
+			else
+				MODE="rebuild"
+			fi
+			umount "$temp"
+		else
+			MODE="rebuild"
+		fi
+		rmdir "$temp"
+	else
+		MODE="initialize"
+	fi
+}
+
+choose_mode() {
+	echo
+	echo "Detected destination state: $MODE"
+	case "$MODE" in
+		update)
+			echo "1. Update the recognized bootable mirror"
+			echo "2. Verify it without copying"
+			echo "3. Rebuild it from scratch"
+			echo "4. Cancel"
+			read -r -p "Select an action: " answer
+			case "$answer" in 1) MODE="update";; 2) MODE="verify";; 3) MODE="rebuild";; *) die "Cancelled.";; esac
+			if [ "$MODE" = "rebuild" ]; then
+				echo "The destination will be erased and initialized again."
+				read -r -p "Continue to destructive confirmation? (yes/no): " answer
+				[ "$answer" = "yes" ] || die "Cancelled."
+				MODE="initialize"
+			fi
+			;;
+		resume)
+			echo "1. Resume copying to the initialized destination"
+			echo "2. Rebuild it from scratch"
+			echo "3. Cancel"
+			read -r -p "Select an action: " answer
+			case "$answer" in 1) MODE="resume";; 2) MODE="rebuild";; *) die "Cancelled.";; esac
+			if [ "$MODE" = "rebuild" ]; then
+				echo "The destination will be erased and initialized again."
+				read -r -p "Continue to destructive confirmation? (yes/no): " answer
+				[ "$answer" = "yes" ] || die "Cancelled."
+				MODE="initialize"
+			fi
+			;;
+		initialize|rebuild)
+			echo "The destination must be erased and initialized."
+			read -r -p "Continue to destructive confirmation? (yes/no): " answer
+			[ "$answer" = "yes" ] || die "Cancelled."
+			MODE="initialize"
+			;;
+	esac
+}
+
+capacity_check() {
+	local source_used boot_bytes destination_bytes required reserve
+	source_used="$(df -B1 --output=used / | tail -n1 | xargs)"
+	boot_bytes="$(blockdev --getsize64 "$SOURCE_BOOT")"
+	destination_bytes="$(blockdev --getsize64 "$DEST_DISK")"
+	reserve=$((source_used / 5))
+	[ "$reserve" -ge 4294967296 ] || reserve=4294967296
+	required=$((source_used + boot_bytes + reserve + 1073741824))
+	echo "Source root data used : $source_used bytes"
+	echo "Source boot size      : $boot_bytes bytes"
+	echo "Required with reserve : $required bytes"
+	echo "Destination capacity  : $destination_bytes bytes"
+	[ "$destination_bytes" -ge "$required" ] || die "The destination does not have enough capacity."
+}
+
+confirm_erase() {
+	local serial="$1" confirmation
+	echo
+	echo "ALL DATA AND EXISTING PARTITION INFORMATION ON $DEST_DISK WILL BE ERASED."
+	lsblk -d -o NAME,SIZE,MODEL,SERIAL,WWN,TRAN "$DEST_DISK"
+	read -r -p "Type ERASE $serial to continue: " confirmation
+	[ "$confirmation" = "ERASE $serial" ] || die "Destructive confirmation did not match."
+}
+
+initialize_destination() {
+	local serial="$1" boot_start boot_size root_start new_id layout layout_file expected_boot_bytes actual_boot_bytes kernel_baseline status=0
+	assert_device_identity "$serial"
+	boot_start="$(sfdisk -d "$SOURCE_DISK" | awk -F'[=, ]+' -v dev="$SOURCE_BOOT" '$1==dev{for(i=1;i<=NF;i++)if($i=="start")print $(i+1)}')"
+	boot_size="$(sfdisk -d "$SOURCE_DISK" | awk -F'[=, ]+' -v dev="$SOURCE_BOOT" '$1==dev{for(i=1;i<=NF;i++)if($i=="size")print $(i+1)}')"
+	root_start="$(sfdisk -d "$SOURCE_DISK" | awk -F'[=, ]+' -v dev="$SOURCE_ROOT" '$1==dev{for(i=1;i<=NF;i++)if($i=="start")print $(i+1)}')"
+	[ -n "$boot_start" ] && [ -n "$boot_size" ] && [ -n "$root_start" ] || die "Could not read source partition geometry."
+	new_id="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+	while lsblk -rno PARTUUID | grep -Eqi "^${new_id}-"; do
+		new_id="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+	done
+	log "Clearing destination signatures on $DEST_DISK."
+	while read -r mounted; do
+		[ -n "$mounted" ] && umount "$mounted"
+	done < <(findmnt -rn -o SOURCE,TARGET | awk -v d="$DEST_DISK" '$1 ~ ("^" d "([0-9]+|p[0-9]+)$"){print $2}')
+	wipefs --all --force "$DEST_DISK"
+	assert_device_identity "$serial"
+	layout="$(printf 'label: dos\nlabel-id: 0x%s\nunit: sectors\n\n%s : start=%s, size=%s, type=c\n%s : start=%s, type=83\n' "$new_id" "$DEST_BOOT" "$boot_start" "$boot_size" "$DEST_ROOT" "$root_start")"
+	layout_file="$(mktemp)"
+	printf '%s' "$layout" >"$layout_file"
+	kernel_baseline="$(dmesg 2>/dev/null | wc -l)"
+	run_with_spinner "Writing destination partition table" bash -c 'sfdisk --force "$1" <"$2"' _ "$DEST_DISK" "$layout_file" || status=$?
+	rm -f "$layout_file"
+	[ "$status" -eq 0 ] || die "Writing the destination partition table failed."
+	partprobe "$DEST_DISK"
+	udevadm settle
+	sync
+	log "Allowing the destination controller 3 seconds to settle after partitioning."
+	sleep 3
+	if new_kernel_storage_errors "$kernel_baseline"; then
+		die "Writing the destination partition table caused a destination storage or USB transport error."
+	fi
+	DEST_BOOT="$(partition_path "$DEST_DISK" 1)"
+	DEST_ROOT="$(partition_path "$DEST_DISK" 2)"
+	wait_for_destination_partitions "$serial"
+	[ "$(lsblk -dnro PTTYPE "$DEST_DISK")" = "dos" ] || die "Destination partition table is not DOS/MBR after initialization."
+	expected_boot_bytes="$(blockdev --getsize64 "$SOURCE_BOOT")"
+	actual_boot_bytes="$(blockdev --getsize64 "$DEST_BOOT")"
+	[ "$actual_boot_bytes" -eq "$expected_boot_bytes" ] || die "Destination boot partition has an unexpected size."
+	[ "$(blkid -s PARTUUID -o value "$DEST_BOOT")" != "$(blkid -s PARTUUID -o value "$SOURCE_BOOT")" ] || die "Boot PARTUUID conflicts with source."
+	[ "$(blkid -s PARTUUID -o value "$DEST_ROOT")" != "$(blkid -s PARTUUID -o value "$SOURCE_ROOT")" ] || die "Root PARTUUID conflicts with source."
+	run_storage_step "Creating the destination FAT32 boot filesystem." 3 mkfs.vfat -F 32 -n bootfs "$DEST_BOOT"
+	assert_device_identity "$serial"
+	run_storage_step "Creating the destination ext4 root filesystem with discard disabled." 3 mkfs.ext4 -F -q -E nodiscard -L rootfs "$DEST_ROOT"
+	udevadm settle
+	assert_device_identity "$serial"
+	[ "$(blkid -s TYPE -o value "$DEST_BOOT")" = "vfat" ] || die "Destination boot filesystem creation failed."
+	[ "$(blkid -s TYPE -o value "$DEST_ROOT")" = "ext4" ] || die "Destination root filesystem creation failed."
+}
+
+write_initialized_marker() {
+	local serial="$1"
+	mkdir -p "$MOUNT_ROOT"
+	mount "$DEST_ROOT" "$MOUNT_ROOT"
+	MOUNTED_PATHS+=("$MOUNT_ROOT")
+	mkdir -p "$MOUNT_ROOT/$METADATA_DIR_REL"
+	{
+		echo "STATE=INITIALIZED_INCOMPLETE"
+		echo "SOURCE_SERIAL=$(physical_device_id "$SOURCE_DISK")"
+		echo "DESTINATION_SERIAL=$serial"
+		echo "INITIALIZED=$(date -Is)"
+		echo "PROGRAM_VERSION=$VERSION"
+	} >"$MOUNT_ROOT/$INIT_MARKER_REL"
+	sync
+	umount "$MOUNT_ROOT"
+	MOUNTED_PATHS=()
+	rmdir "$MOUNT_ROOT"
+}
+
+validate_initialized_marker() {
+	local marker="$MOUNT_ROOT/$INIT_MARKER_REL" marked_source marked_destination
+	[ -f "$marker" ] || die "The initialized destination marker is missing."
+	marked_source="$(awk -F= '$1=="SOURCE_SERIAL"{sub(/^[^=]*=/,""); print; exit}' "$marker")"
+	marked_destination="$(awk -F= '$1=="DESTINATION_SERIAL"{sub(/^[^=]*=/,""); print; exit}' "$marker")"
+	[ "$marked_source" = "$(physical_device_id "$SOURCE_DISK")" ] || die "This initialized destination belongs to a different source disk."
+	[ "$marked_destination" = "$(destination_serial)" ] || die "Initialized marker does not match the selected destination."
+}
+
+validate_initialized_layout() {
+	[ "$(lsblk -dnro PTTYPE "$DEST_DISK")" = "dos" ] || die "Initialized destination is no longer DOS/MBR."
+	[ "$(blkid -s TYPE -o value "$DEST_BOOT")" = "vfat" ] || die "Initialized destination boot filesystem is not FAT32."
+	[ "$(blkid -s TYPE -o value "$DEST_ROOT")" = "ext4" ] || die "Initialized destination root filesystem is not ext4."
+	[ "$(blkid -s PARTUUID -o value "$DEST_BOOT")" != "$(blkid -s PARTUUID -o value "$SOURCE_BOOT")" ] || die "Initialized boot PARTUUID conflicts with source."
+	[ "$(blkid -s PARTUUID -o value "$DEST_ROOT")" != "$(blkid -s PARTUUID -o value "$SOURCE_ROOT")" ] || die "Initialized root PARTUUID conflicts with source."
+}
+
+initialization_checkpoint() {
+	local answer elapsed
+	elapsed="$(( $(date +%s) - START_EPOCH ))"
+	echo
+	echo "DESTINATION INITIALIZATION: PASSED"
+	echo "----------------------------------"
+	printf 'Destination : %s\n' "$DEST_DISK"
+	printf 'Model       : %s\n' "$(lsblk -dnro MODEL "$DEST_DISK" | xargs)"
+	printf 'Serial      : %s\n' "$(destination_serial)"
+	printf 'Boot        : %s — FAT32 — %s\n' "$DEST_BOOT" "$(lsblk -dnro SIZE "$DEST_BOOT")"
+	printf 'Root        : %s — ext4 — %s\n' "$DEST_ROOT" "$(lsblk -dnro SIZE "$DEST_ROOT")"
+	printf 'System time : %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+	printf 'Elapsed     : %s\n' "$(format_duration "$elapsed")"
+	echo
+	echo "The destination is correctly partitioned and formatted but does not yet"
+	echo "contain a bootable system."
+	echo
+	read -r -p "Continue with the filesystem copy? (yes/no): " answer
+	[ "$answer" = "yes" ]
+}
+
+mount_destination() {
+	local mount_options="${1:-rw}"
+	mkdir -p "$MOUNT_ROOT"
+	mount -o "$mount_options" "$DEST_ROOT" "$MOUNT_ROOT"
+	MOUNTED_PATHS+=("$MOUNT_ROOT")
+	local destination_boot_mount="$MOUNT_ROOT$BOOT_MOUNT"
+	mkdir -p "$destination_boot_mount"
+	mount -o "$mount_options" "$DEST_BOOT" "$destination_boot_mount"
+	MOUNTED_PATHS+=("$destination_boot_mount")
+}
+
+root_rsync() {
+	local label="${1:-Copying root filesystem}"
+	echo
+	echo "$label"
+	echo "System time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+	rsync -aHAXS --numeric-ids --delete --one-file-system --human-readable --info=progress2 \
+		--exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' \
+		--exclude='/run/*' --exclude='/tmp/*' --exclude='/var/tmp/*' \
+		--exclude='/mnt/***' --exclude='/media/***' --exclude='/lost+found' \
+		--exclude="$BOOT_MOUNT/***" --exclude='/var/lib/pcp/tmp/***' \
+		--exclude='/var/swap' \
+		--exclude='/var/log/asl-bootable-mirror.log' \
+		--exclude="/$METADATA_DIR_REL/***" \
+		/ "$MOUNT_ROOT/"
+	# initramfs must have these mount points before it can hand off to init.
+	# The /* exclusions above retain each source directory and its exact metadata
+	# while omitting live/runtime contents. mkdir is an idempotent safety fallback.
+	mkdir -p "$MOUNT_ROOT/dev" "$MOUNT_ROOT/proc" "$MOUNT_ROOT/sys" \
+		"$MOUNT_ROOT/run" "$MOUNT_ROOT/tmp" "$MOUNT_ROOT/var/tmp"
+	# A swap file copied with rsync sparse-file handling can contain holes and
+	# will be rejected by swapon. Leave it absent so dphys-swapfile creates a
+	# correctly allocated file on the clone's first boot.
+	if [ -e "$MOUNT_ROOT/var/swap" ] || [ -L "$MOUNT_ROOT/var/swap" ]; then
+		log "Removing destination /var/swap; dphys-swapfile will recreate it on boot."
+		rm -f -- "$MOUNT_ROOT/var/swap"
+	fi
+	mkdir -p "$MOUNT_ROOT/mnt" "$MOUNT_ROOT/media"
+	rsync -a --one-file-system --include='*/' --exclude='*' /mnt/ "$MOUNT_ROOT/mnt/"
+	rsync -a --one-file-system --include='*/' --exclude='*' /media/ "$MOUNT_ROOT/media/"
+}
+
+boot_rsync() {
+	local label="${1:-Copying boot filesystem}"
+	echo
+	echo "$label"
+	echo "System time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+	rsync -rt --delete --modify-window=2 --human-readable --info=progress2 "$BOOT_MOUNT/" "$MOUNT_ROOT$BOOT_MOUNT/"
+}
+
+finalize_destination() {
+	local boot_partuuid root_partuuid fstab cmdline
+	boot_partuuid="$(blkid -s PARTUUID -o value "$DEST_BOOT")"
+	root_partuuid="$(blkid -s PARTUUID -o value "$DEST_ROOT")"
+	fstab="$MOUNT_ROOT/etc/fstab"
+	cmdline="$MOUNT_ROOT$BOOT_MOUNT/cmdline.txt"
+	[ -f "$fstab" ] && [ -f "$cmdline" ] || die "Destination fstab or cmdline.txt is missing."
+	awk -v bp="PARTUUID=$boot_partuuid" -v rp="PARTUUID=$root_partuuid" '
+		$2=="/boot/firmware" || $2=="/boot" {sub(/^[^[:space:]]+/,bp)}
+		$2=="/" {sub(/^[^[:space:]]+/,rp)}
+		{print $0}
+	' "$fstab" > "$fstab.tmp"
+	cat "$fstab.tmp" > "$fstab"
+	rm -f "$fstab.tmp"
+	sed -E -i "s#root=[^ ]+#root=PARTUUID=$root_partuuid#" "$cmdline"
+	mkdir -p "$MOUNT_ROOT/$(dirname "$MARKER_REL")"
+	{
+		echo "SOURCE_HOSTNAME=$(hostname)"
+		echo "SOURCE_DISK=$SOURCE_DISK"
+		echo "SOURCE_SERIAL=$(physical_device_id "$SOURCE_DISK")"
+		echo "DESTINATION_SERIAL=$(destination_serial)"
+		echo "CREATED_OR_UPDATED=$(date -Is)"
+	} > "$MOUNT_ROOT/$MARKER_REL"
+	rm -f "$MOUNT_ROOT/$INIT_MARKER_REL"
+}
+
+is_protected_service() {
+	case "$1" in
+		ssh.service|sshd.service|NetworkManager.service|systemd-networkd.service|systemd-resolved.service|networking.service|dbus.service|systemd-logind.service|systemd-udevd.service|systemd-journald.service|systemd-timesyncd.service)
+			return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+service_is_recommended() {
+	local unit="$1" details
+	details="$(systemctl show "$unit" -p Id -p Description -p ExecStart -p FragmentPath 2>/dev/null)"
+	printf '%s\n' "$details" |
+		grep -Eiq 'asterisk|apache2|analog.?bridge|mmdvm.?bridge|p25gateway|ysfgateway|nxdngateway|dvswitch|stfu|md380|pmproxy|web.?proxy|mosquitto|mqtt|mariadb|mysql|postgresql|pi.?monitor|pcp|pmie'
+}
+
+load_services() {
+	local unit
+	mapfile -t RUNNING_SERVICES < <(
+		{
+			systemctl list-units --type=service --state=running --no-legend --no-pager | awk '{print $1}'
+			while read -r unit; do
+				systemctl is-active --quiet "$unit" && printf '%s\n' "$unit"
+			done < <(systemctl list-timers --all --no-legend --no-pager | awk '$(NF-1) ~ /\.timer$/ {print $(NF-1)}')
+		} |
+		sort -u
+	)
+	RECOMMENDED_SERVICES=()
+	for unit in "${RUNNING_SERVICES[@]}"; do
+		if ! is_protected_service "$unit" && service_is_recommended "$unit"; then
+			RECOMMENDED_SERVICES+=("$unit")
+		fi
+	done
+	SELECTED_SERVICES=("${RECOMMENDED_SERVICES[@]}")
+}
+
+array_contains() {
+	local wanted="$1"
+	shift
+	local item
+	for item in "$@"; do
+		[ "$item" = "$wanted" ] && return 0
+	done
+	return 1
+}
+
+add_selected_service() {
+	local unit="$1"
+	is_protected_service "$unit" && {
+		echo "Cannot select protected service: $unit"
+		return 1
+	}
+	array_contains "$unit" "${SELECTED_SERVICES[@]}" || SELECTED_SERVICES+=("$unit")
+}
+
+remove_selected_service() {
+	local unwanted="$1" item
+	local -a updated=()
+	for item in "${SELECTED_SERVICES[@]}"; do
+		[ "$item" != "$unwanted" ] && updated+=("$item")
+	done
+	SELECTED_SERVICES=("${updated[@]}")
+}
+
+show_service_list() {
+	local i unit flags
+	echo
+	echo "RUNNING SERVICES AND ACTIVE TIMERS"
+	echo "----------------------------------"
+	for i in "${!RUNNING_SERVICES[@]}"; do
+		unit="${RUNNING_SERVICES[$i]}"
+		flags=""
+		is_protected_service "$unit" && flags="$flags [PROTECTED]"
+		array_contains "$unit" "${RECOMMENDED_SERVICES[@]}" && flags="$flags [RECOMMENDED]"
+		array_contains "$unit" "${SELECTED_SERVICES[@]}" && flags="$flags [SELECTED]"
+		printf '[%3d] %-45s%s\n' "$((i+1))" "$unit" "$flags"
+	done
+}
+
+show_service_selection_help() {
+	cat <<'EOF'
+
+Enter service numbers separated by spaces. Ranges may be combined with
+individual numbers.
+
+Examples:
+  1 3 5       Select services 1, 3 and 5
+  1-5         Select services 1 through 5
+  1-3 6 8-10  Select 1 through 3, service 6, and 8 through 10
+  +2 +7       Add services 2 and 7
+  -3 -5       Remove services 3 and 5
+
+Commands:
+  recommended Select the automatically recommended services
+  all         Select every eligible service
+  none        Clear the current selection
+  show        Display the service list again
+  done        Accept the current selection
+  cancel      Cancel the operation
+
+Protected services are displayed but cannot be selected.
+EOF
+}
+
+show_current_service_selection() {
+	echo
+	echo "Currently selected services/timers:"
+	if [ "${#SELECTED_SERVICES[@]}" -eq 0 ]; then
+		echo "  (none)"
+	else
+		printf '  %s\n' "${SELECTED_SERVICES[@]}"
+	fi
+}
+
+apply_service_token() {
+	local token="$1" operation="" first last number unit
+	if [[ "$token" =~ ^\+([0-9]+)$ ]]; then
+		operation="add"
+		first="${BASH_REMATCH[1]}"
+		last="$first"
+	elif [[ "$token" =~ ^-([0-9]+)$ ]]; then
+		operation="remove"
+		first="${BASH_REMATCH[1]}"
+		last="$first"
+	elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+		operation="add"
+		first="${BASH_REMATCH[1]}"
+		last="${BASH_REMATCH[2]}"
+	elif [[ "$token" =~ ^([0-9]+)$ ]]; then
+		operation="add"
+		first="${BASH_REMATCH[1]}"
+		last="$first"
+	else
+		echo "Invalid entry: $token"
+		return 1
+	fi
+	if [ "$first" -gt "$last" ] || [ "$first" -lt 1 ] || [ "$last" -gt "${#RUNNING_SERVICES[@]}" ]; then
+		echo "Invalid or out-of-range entry: $token"
+		return 1
+	fi
+	for ((number=first; number<=last; number++)); do
+		unit="${RUNNING_SERVICES[$((number-1))]}"
+		if [ "$operation" = "remove" ]; then
+			remove_selected_service "$unit"
+		else
+			add_selected_service "$unit" || true
+		fi
+	done
+}
+
+review_service_selection() {
+	local input token invalid
+	show_service_list
+	show_service_selection_help
+	while true; do
+		show_current_service_selection
+		read -r -p "Enter numbers, ranges or a command: " input
+		case "$input" in
+			recommended)
+				SELECTED_SERVICES=("${RECOMMENDED_SERVICES[@]}")
+				;;
+			all)
+				SELECTED_SERVICES=()
+				for token in "${RUNNING_SERVICES[@]}"; do
+					is_protected_service "$token" || SELECTED_SERVICES+=("$token")
+				done
+				;;
+			none)
+				SELECTED_SERVICES=()
+				;;
+			show)
+				show_service_list
+				show_service_selection_help
+				;;
+			done)
+				return 0
+				;;
+			cancel)
+				die "Cancelled."
+				;;
+			*)
+				invalid=0
+				for token in $input; do
+					apply_service_token "$token" || invalid=1
+				done
+				if [ "$invalid" -ne 0 ]; then
+					echo
+					echo "Use entries such as: 1 3 5, 1-5, 1-3 6 8-10, +2 or -3."
+				fi
+				;;
+		esac
+	done
+}
+
+offer_consistent_pass() {
+	local answer service confirmation
+	load_services
+	echo
+	echo "FULL CONTENT VERIFICATION"
+	echo "A consistent checksum verification requires a short pause of services"
+	echo "and timers that can change persistent files. SSH and networking remain running."
+	if [ "${#RECOMMENDED_SERVICES[@]}" -gt 0 ]; then
+		printf '\nAutomatically recommended services:\n'
+		printf '  %s\n' "${RECOMMENDED_SERVICES[@]}"
+	else
+		echo
+		echo "No services were automatically recommended."
+	fi
+	cat <<'EOF'
+
+Choose:
+  1. Accept the recommended service list
+  2. Review/add/remove services
+  3. Continue without pausing services and without full verification
+  4. Cancel
+EOF
+	read -r -p "Select an option: " answer
+	case "$answer" in
+		1)
+			SELECTED_SERVICES=("${RECOMMENDED_SERVICES[@]}")
+			;;
+		2)
+			review_service_selection
+			;;
+		3)
+			SERVICES_PAUSED="NO"
+			return
+			;;
+		4|*)
+			die "Cancelled."
+			;;
+	esac
+	show_current_service_selection
+	echo
+	echo "SSH, networking and protected system services will remain running."
+	read -r -p "Pause the selected services and create a verified copy? (yes/no): " confirmation
+	if [ "$confirmation" = "yes" ]; then
+			for service in "${SELECTED_SERVICES[@]}"; do
+				if systemctl is-active --quiet "$service"; then
+					systemctl stop "$service"
+					STOPPED_SERVICES+=("$service")
+				fi
+			done
+			SERVICES_PAUSED="YES"
+			echo "Waiting 3 seconds for paused units to finish pending writes."
+			sync
+			sleep 3
+			root_rsync "Final root synchronization"
+			boot_rsync "Final boot synchronization"
+			finalize_destination
+	else
+		SERVICES_PAUSED="NO"
+	fi
+}
+
+restart_paused_services() {
+	local service
+	local -a failed=()
+	if [ "${#STOPPED_SERVICES[@]}" -gt 0 ]; then
+		systemctl start "${STOPPED_SERVICES[@]}" || true
+	fi
+	for service in "${STOPPED_SERVICES[@]}"; do
+		systemctl is-active --quiet "$service" || failed+=("$service")
+	done
+	if [ "${#STOPPED_SERVICES[@]}" -gt 0 ]; then
+		log "Restart request completed for paused services/timers: ${STOPPED_SERVICES[*]}"
+	fi
+	STOPPED_SERVICES=()
+	[ "${#failed[@]}" -eq 0 ] || die "These paused units failed to restart: ${failed[*]}"
+}
+
+verify_structure() {
+	local actual_boot actual_root fstab_boot fstab_root cmdline_root
+	actual_boot="$(blkid -s PARTUUID -o value "$DEST_BOOT")"
+	actual_root="$(blkid -s PARTUUID -o value "$DEST_ROOT")"
+	fstab_boot="$(awk '$2=="/boot/firmware" || $2=="/boot"{sub(/^PARTUUID=/,"",$1); print $1; exit}' "$MOUNT_ROOT/etc/fstab")"
+	fstab_root="$(awk '$2=="/"{sub(/^PARTUUID=/,"",$1); print $1; exit}' "$MOUNT_ROOT/etc/fstab")"
+	cmdline_root="$(grep -oE 'root=PARTUUID=[^ ]+' "$MOUNT_ROOT$BOOT_MOUNT/cmdline.txt" | head -n1 | cut -d= -f3)"
+	[ "$actual_boot" = "$fstab_boot" ] || die "Destination boot PARTUUID does not match fstab."
+	[ "$actual_root" = "$fstab_root" ] || die "Destination root PARTUUID does not match fstab."
+	[ "$actual_root" = "$cmdline_root" ] || die "Destination root PARTUUID does not match cmdline.txt."
+	[ "$actual_boot" != "$(blkid -s PARTUUID -o value "$SOURCE_BOOT")" ] || die "Destination boot PARTUUID conflicts with source."
+	[ "$actual_root" != "$(blkid -s PARTUUID -o value "$SOURCE_ROOT")" ] || die "Destination root PARTUUID conflicts with source."
+	for file in config.txt cmdline.txt; do
+		[ -s "$MOUNT_ROOT$BOOT_MOUNT/$file" ] || die "Required boot file is missing: $file"
+	done
+	compgen -G "$MOUNT_ROOT$BOOT_MOUNT/kernel*.img" >/dev/null || die "No Raspberry Pi kernel image was found on the destination boot filesystem."
+	compgen -G "$MOUNT_ROOT$BOOT_MOUNT/*.dtb" >/dev/null || die "No Raspberry Pi device-tree file was found on the destination boot filesystem."
+	[ -x "$MOUNT_ROOT/sbin/init" ] || die "Destination /sbin/init is missing."
+	for directory in dev proc sys run tmp var/tmp; do
+		[ -d "$MOUNT_ROOT/$directory" ] || die "Required root mount-point directory is missing: /$directory"
+	done
+}
+
+validate_clone_marker() {
+	local marker="$MOUNT_ROOT/$MARKER_REL"
+	local marked_source marked_destination current_source current_destination
+	[ -f "$marker" ] || die "The destination is missing its clone identity marker."
+	marked_source="$(awk -F= '$1=="SOURCE_SERIAL"{sub(/^[^=]*=/,""); print; exit}' "$marker")"
+	marked_destination="$(awk -F= '$1=="DESTINATION_SERIAL"{sub(/^[^=]*=/,""); print; exit}' "$marker")"
+	current_source="$(physical_device_id "$SOURCE_DISK")"
+	current_destination="$(destination_serial)"
+	[ "$marked_source" = "$current_source" ] || die "This clone belongs to a different source drive."
+	[ "$marked_destination" = "$current_destination" ] || die "Clone marker does not match the selected physical destination."
+}
+
+verify_content() {
+	local root_diff boot_diff root_manifest boot_manifest status=0
+	root_diff="$(mktemp)"
+	boot_diff="$(mktemp)"
+	root_manifest="$(mktemp)"
+	boot_manifest="$(mktemp)"
+	run_with_spinner "Comparing source and destination root contents" bash -c '
+		rsync -aHAXSnic --delete --one-file-system --omit-dir-times \
+			--exclude="/dev/*" --exclude="/proc/*" --exclude="/sys/*" \
+			--exclude="/run/*" --exclude="/tmp/*" --exclude="/var/tmp/*" \
+			--exclude="/mnt/***" --exclude="/media/***" --exclude="/lost+found" \
+			--exclude="$2/***" --exclude="/var/lib/pcp/tmp/***" \
+			--exclude="/var/swap" \
+			--exclude="/var/log/***" --exclude="/var/lib/systemd/timesync/clock" \
+			--exclude="/var/lib/systemd/timers/***" --exclude="/etc/fstab" \
+			--exclude="/var/lib/asl-bootable-mirror/***" \
+			/ "$1/" >"$3"
+	' _ "$MOUNT_ROOT" "$BOOT_MOUNT" "$root_diff" || status=$?
+	[ "$status" -eq 0 ] || die "The source-to-destination root comparison could not be completed."
+	status=0
+	run_with_spinner "Comparing source and destination boot contents" bash -c '
+		rsync -rtni --checksum --delete --modify-window=2 --omit-dir-times \
+			--exclude="/cmdline.txt" "$1/" "$2/" >"$3"
+	' _ "$BOOT_MOUNT" "$MOUNT_ROOT$BOOT_MOUNT" "$boot_diff" || status=$?
+	[ "$status" -eq 0 ] || die "The source-to-destination boot comparison could not be completed."
+	if [ -s "$root_diff" ] || [ -s "$boot_diff" ]; then
+		log "Root verification differences:"
+		cat "$root_diff" | tee -a "$LOG_FILE"
+		log "Boot verification differences:"
+		cat "$boot_diff" | tee -a "$LOG_FILE"
+		rm -f "$root_diff" "$boot_diff" "$root_manifest" "$boot_manifest"
+		die "Checksum verification found unexplained differences."
+	fi
+	rm -f "$root_diff" "$boot_diff"
+
+	echo
+	echo "Source-to-destination comparison passed."
+	echo "Restarting paused services/timers before destination readback."
+	restart_paused_services
+
+	run_with_spinner "Creating destination root SHA-256 manifest" bash -c '
+		cd "$1"
+		find . -xdev -type f -print0 | sort -z | xargs -0 -r sha256sum >"$2"
+	' _ "$MOUNT_ROOT" "$root_manifest" || die "Could not create the destination root checksum manifest."
+	run_with_spinner "Reading back and verifying destination root files" bash -c '
+		cd "$1"
+		sha256sum --quiet -c "$2"
+	' _ "$MOUNT_ROOT" "$root_manifest" || die "Destination root readback verification failed."
+	run_with_spinner "Creating destination boot SHA-256 manifest" bash -c '
+		cd "$1"
+		find . -xdev -type f -print0 | sort -z | xargs -0 -r sha256sum >"$2"
+	' _ "$MOUNT_ROOT$BOOT_MOUNT" "$boot_manifest" || die "Could not create the destination boot checksum manifest."
+	run_with_spinner "Reading back and verifying destination boot files" bash -c '
+		cd "$1"
+		sha256sum --quiet -c "$2"
+	' _ "$MOUNT_ROOT$BOOT_MOUNT" "$boot_manifest" || die "Destination boot readback verification failed."
+	mkdir -p "$MOUNT_ROOT/$METADATA_DIR_REL"
+	cp "$root_manifest" "$MOUNT_ROOT/$METADATA_DIR_REL/SHA256SUMS-root.txt"
+	cp "$boot_manifest" "$MOUNT_ROOT/$METADATA_DIR_REL/SHA256SUMS-boot.txt"
+	rm -f "$root_manifest" "$boot_manifest"
+	CONTENT_VERIFIED="YES"
+}
+
+verify_stored_manifests() {
+	local root_manifest="$MOUNT_ROOT/$METADATA_DIR_REL/SHA256SUMS-root.txt"
+	local boot_manifest="$MOUNT_ROOT/$METADATA_DIR_REL/SHA256SUMS-boot.txt"
+	[ -s "$root_manifest" ] || die "The stored root SHA-256 manifest is missing."
+	[ -s "$boot_manifest" ] || die "The stored boot SHA-256 manifest is missing."
+	run_with_spinner "Reading back destination root files" bash -c '
+		cd "$1"
+		sha256sum --quiet -c "$2"
+	' _ "$MOUNT_ROOT" "$root_manifest" || die "Stored root checksum verification failed."
+	run_with_spinner "Reading back destination boot files" bash -c '
+		cd "$1"
+		sha256sum --quiet -c "$2"
+	' _ "$MOUNT_ROOT$BOOT_MOUNT" "$boot_manifest" || die "Stored boot checksum verification failed."
+}
+
+write_report() {
+	mkdir -p "$MOUNT_ROOT/$(dirname "$REPORT_REL")"
+	{
+		echo "ASL/DVSwitch bootable mirror report"
+		echo "Date: $(date -Is)"
+		echo "Total elapsed: $(format_duration "$(( $(date +%s) - START_EPOCH ))")"
+		echo "Program version: $VERSION"
+		echo "Source: $SOURCE_DISK"
+		echo "Destination: $DEST_DISK"
+		echo "Mode: $MODE"
+		echo "Services paused: $SERVICES_PAUSED"
+		echo "Full content verification: $CONTENT_VERIFIED"
+		echo "Bootability structure check: PASSED"
+		echo "Destination boot PARTUUID: $(blkid -s PARTUUID -o value "$DEST_BOOT")"
+		echo "Destination root PARTUUID: $(blkid -s PARTUUID -o value "$DEST_ROOT")"
+	} | tee "$MOUNT_ROOT/$REPORT_REL" | tee -a "$LOG_FILE"
+}
+
+unmount_destination() {
+	sync
+	for ((i=${#MOUNTED_PATHS[@]}-1; i>=0; i--)); do
+		if mountpoint -q "${MOUNTED_PATHS[$i]}"; then
+			umount "${MOUNTED_PATHS[$i]}"
+		fi
+	done
+}
+
+verify_filesystems_read_only() {
+	fsck.vfat -n "$DEST_BOOT"
+	e2fsck -fn "$DEST_ROOT"
+}
+
+main() {
+	if [ "${1:-}" = "--preflight" ]; then
+		PREFLIGHT_ONLY="YES"
+	elif [ "${1:-}" = "--version" ]; then
+		echo "$PROGRAM $VERSION"
+		return
+	elif [ "$#" -gt 0 ]; then
+		echo "Usage: sudo $PROGRAM [--preflight|--version]" >&2
+		exit 2
+	fi
+	require_root
+	require_commands
+	touch "$LOG_FILE"
+	stage_header "1" "PREFLIGHT"
+	detect_source
+	select_destination
+	local serial
+	serial="$(destination_serial)"
+	classify_destination
+	capacity_check
+	if [ "$PREFLIGHT_ONLY" = "YES" ]; then
+		echo
+		echo "PREFLIGHT ONLY — NO DATA WAS WRITTEN"
+		echo "Source disk      : $SOURCE_DISK"
+		echo "Source boot      : $SOURCE_BOOT ($BOOT_MOUNT)"
+		echo "Source root      : $SOURCE_ROOT"
+		echo "Destination disk : $DEST_DISK"
+		echo "Detected state   : $MODE"
+		echo "Destination ID   : $serial"
+		show_boot_reminder
+		return
+	fi
+	choose_mode
+	if [ "$MODE" = "initialize" ]; then
+		stage_header "2" "DESTINATION INITIALIZATION"
+		confirm_erase "$serial"
+		initialize_destination "$serial"
+		write_initialized_marker "$serial"
+		verify_filesystems_read_only
+		stage_header "3" "INITIALIZATION CHECKPOINT"
+		if ! initialization_checkpoint; then
+			echo
+			echo "RESULT: INITIALIZED DESTINATION — COPY NOT STARTED"
+			echo "A later $PROGRAM $VERSION run will recognize this destination and offer to resume."
+			show_boot_reminder
+			return
+		fi
+	fi
+	assert_device_identity "$serial"
+	if [ "$MODE" = "verify" ]; then
+		stage_header "6" "EXISTING MIRROR STRUCTURAL VERIFICATION"
+		mount_destination ro
+		validate_clone_marker
+		verify_structure
+		verify_stored_manifests
+		unmount_destination
+		verify_filesystems_read_only
+		show_boot_reminder
+		return
+	fi
+	stage_header "4" "INITIAL FILESYSTEM COPY"
+	validate_initialized_layout
+	mount_destination rw
+	if [ "$MODE" = "update" ]; then
+		validate_clone_marker
+	elif [ "$MODE" = "resume" ]; then
+		validate_initialized_marker
+	fi
+	root_rsync "Initial root filesystem copy"
+	boot_rsync "Initial boot filesystem copy"
+	finalize_destination
+	stage_header "5" "CONSISTENT FINAL SYNCHRONIZATION"
+	offer_consistent_pass
+	stage_header "6" "CONTENT AND BOOT VERIFICATION"
+	verify_structure
+	if [ "$SERVICES_PAUSED" = "YES" ]; then
+		verify_content
+	else
+		log "Full content verification was not performed because services remained active."
+	fi
+	restart_paused_services
+	stage_header "7" "FINAL FILESYSTEM CHECKS AND REPORT"
+	write_report
+	sync
+	unmount_destination
+	verify_filesystems_read_only
+	show_boot_reminder
+	echo
+	if [ "$CONTENT_VERIFIED" = "YES" ]; then
+		echo "RESULT: VERIFIED BOOTABLE FILESYSTEM MIRROR"
+	else
+		echo "RESULT: BOOTABLE FILESYSTEM MIRROR — FULL CONTENT NOT VERIFIED"
+	fi
+}
+
+if [ "${ASL_BOOTABLE_MIRROR_NO_MAIN:-0}" != "1" ]; then
+	main "$@"
+fi
