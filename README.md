@@ -123,19 +123,19 @@ Use only one installation method. Every terminal example below is one copy-and-p
 ### Method 1 — Git
 
 ```bash
-cd /home/asl && git clone https://github.com/ke2hni/asl-bootable-mirror.git && cd asl-bootable-mirror && chmod 755 asl-bootable-mirror install-asl-bootable-mirror && sudo ./install-asl-bootable-mirror
+cd /home/asl && git clone https://github.com/ke2hni/ASL-Bootable-Mirror.git && cd ASL-Bootable-Mirror && chmod 755 asl-bootable-mirror install-asl-bootable-mirror && sudo ./install-asl-bootable-mirror
 ```
 
 ### Method 2 — Wget
 
 ```bash
-cd /home/asl && wget -O asl-bootable-mirror https://raw.githubusercontent.com/ke2hni/asl-bootable-mirror/main/asl-bootable-mirror && wget -O install-asl-bootable-mirror https://raw.githubusercontent.com/ke2hni/asl-bootable-mirror/main/install-asl-bootable-mirror && chmod 755 asl-bootable-mirror install-asl-bootable-mirror && sudo ./install-asl-bootable-mirror
+cd /home/asl && wget -O asl-bootable-mirror https://raw.githubusercontent.com/ke2hni/ASL-Bootable-Mirror/main/asl-bootable-mirror && wget -O install-asl-bootable-mirror https://raw.githubusercontent.com/ke2hni/ASL-Bootable-Mirror/main/install-asl-bootable-mirror && chmod 755 asl-bootable-mirror install-asl-bootable-mirror && sudo ./install-asl-bootable-mirror
 ```
 
 ### Method 3 — Curl
 
 ```bash
-cd /home/asl && curl -fL -o asl-bootable-mirror https://raw.githubusercontent.com/ke2hni/asl-bootable-mirror/main/asl-bootable-mirror && curl -fL -o install-asl-bootable-mirror https://raw.githubusercontent.com/ke2hni/asl-bootable-mirror/main/install-asl-bootable-mirror && chmod 755 asl-bootable-mirror install-asl-bootable-mirror && sudo ./install-asl-bootable-mirror
+cd /home/asl && curl -fL -o asl-bootable-mirror https://raw.githubusercontent.com/ke2hni/ASL-Bootable-Mirror/main/asl-bootable-mirror && curl -fL -o install-asl-bootable-mirror https://raw.githubusercontent.com/ke2hni/ASL-Bootable-Mirror/main/install-asl-bootable-mirror && chmod 755 asl-bootable-mirror install-asl-bootable-mirror && sudo ./install-asl-bootable-mirror
 ```
 
 The installer:
