@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+	echo "Run this installer with sudo."
+	exit 1
+fi
+
+source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source_file="$source_dir/asl-bootable-mirror"
+destination="/usr/local/sbin/asl-bootable-mirror"
+stamp="$(date +%Y%m%d-%H%M%S)"
+
+[ -f "$source_file" ] || {
+	echo "ERROR: $source_file is missing."
+	exit 1
+}
+
+bash -n "$source_file"
+
+if [ -e "$destination" ]; then
+	cp -a "$destination" "$destination.backup-$stamp"
+	echo "Existing version backed up to $destination.backup-$stamp"
+fi
+
+install -o root -g root -m 0755 "$source_file" "$destination"
+
+echo
+echo "Installed $destination"
+echo
+echo "Run the read-only preflight first:"
+echo "  sudo asl-bootable-mirror --preflight"
+echo
+echo "Start an interactive mirror operation only after reviewing preflight:"
+echo "  sudo asl-bootable-mirror"
